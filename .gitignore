@@ -160,5 +160,5 @@ cython_debug/
 #.idea/
 
 # Working file
-logs/*.log.*
+/logs/*.log.*
 *.old.py
