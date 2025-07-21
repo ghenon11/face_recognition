@@ -164,16 +164,14 @@ class FaceRecognitionApp(ctk.CTk):
     def select_root_folder(self):
         folder = filedialog.askdirectory()
         if folder:
-            search_string = simpledialog.askstring("Input", "Enter string to match subfolders:")
-            if search_string:
-                self.root_folder = folder
-                self.label_root_var.set(self.root_folder)
-                config.configfile.set("Settings", "root_folder", folder)  # Save to config
-                config.save_config()  # Persist changes
-                self.matching_folders = [os.path.join(folder, sub) for sub in os.listdir(folder) if search_string in sub and os.path.isdir(os.path.join(folder, sub))]
-                self.label.configure(text=f"Matching Folders: {len(self.matching_folders)} found")
-                if self.selected_image_path:
-                    self.compare_button.configure(state="normal")
+            self.root_folder = folder
+            self.label_root_var.set(self.root_folder)
+            config.configfile.set("Settings", "root_folder", folder)  # Save to config
+            config.save_config()  # Persist changes
+            self.matching_folders = [os.path.join(folder, sub)  for sub in os.listdir(folder) if os.path.isdir(os.path.join(folder, sub))]
+            self.label.configure(text=f"Matching Folders: {len(self.matching_folders)} found")
+            if self.selected_image_path:
+                self.compare_button.configure(state="normal") 
     
     def select_output_folder(self):
         folder = filedialog.askdirectory()
