@@ -2,6 +2,7 @@ import os,time
 import shutil
 import logging, traceback
 import threading, multiprocessing, setproctitle
+from multiprocessing import Pool, cpu_count
 import random
 import concurrent.futures
 import face_recognition
@@ -20,7 +21,8 @@ DB_PATH = "face_recognition.db"
 
 def init_db():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         # Table for file paths (can have same hash in different locations)
         c.execute("""
@@ -97,7 +99,8 @@ def hash_image(file_path):
 
 def get_or_create_file_path(path):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM file_paths WHERE path=?", (path,))
         row = c.fetchone()
@@ -115,7 +118,8 @@ def get_or_create_file_path(path):
 
 def get_or_create_image(hash_val, num_faces):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM images WHERE hash=?", (hash_val,))
         row = c.fetchone()
@@ -133,7 +137,8 @@ def get_or_create_image(hash_val, num_faces):
 
 def map_file_to_image(file_path_id, image_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM file_image_map WHERE file_path_id=? AND image_id=?", (file_path_id, image_id))
         row = c.fetchone()
@@ -146,7 +151,8 @@ def map_file_to_image(file_path_id, image_id):
 
 def insert_image_encoding(image_id, encoding):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM image_encodings WHERE image_id=? AND encoding=?", (image_id, encoding.tobytes()))
         exists = c.fetchone()
@@ -159,7 +165,8 @@ def insert_image_encoding(image_id, encoding):
 
 def insert_match(image_id, person_id):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         # Ensure only one match per image/person
         c.execute("SELECT id FROM matches WHERE image_id=? AND person_id=?", (image_id, person_id))
@@ -175,7 +182,8 @@ def insert_match(image_id, person_id):
 
 def add_person(name):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO persons (name) VALUES (?)", (name,))
         conn.commit()
@@ -195,7 +203,8 @@ def add_known_image_for_person(person_id, image_path):
         num_faces = len(encodings)
         image_id = get_or_create_image(hash_val, num_faces)
         # Check if already linked
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM known_images WHERE person_id=? AND image_id=?", (person_id, image_id))
         exists = c.fetchone()
@@ -213,6 +222,58 @@ def add_known_image_for_person(person_id, image_path):
         logging.info(f"Linked image {image_path} to person ID {person_id}")
     except Exception as e:
         logging.error(f"Error adding known image for person: {e}")
+
+def process_image_for_queue(img):
+        try:
+            formatted_path = Path(img)
+            hash_val = hash_image(img)
+            file_path_id = get_or_create_file_path(str(formatted_path))
+            try:
+                conn = sqlite3.connect(DB_PATH,timeout=10)
+
+                c = conn.cursor()
+                c.execute(
+                    "SELECT images.id, images.num_faces FROM images "
+                    "JOIN file_image_map ON images.id = file_image_map.image_id "
+                    "WHERE file_image_map.file_path_id=? AND images.hash=?",
+                    (file_path_id, hash_val)
+                )
+                row = c.fetchone()
+            except Exception as e:
+                logging.warning(f"Database error for {img}: {e}")
+                row = None
+            finally:
+                conn.close()
+
+            if row:
+                image_id, num_faces = row
+                encodings = []
+                logging.info(f"Image queued: {img} (existing hash, no re-encoding)")
+            else:
+                try:
+                    image = face_recognition.load_image_file(img)
+                    encodings = face_recognition.face_encodings(image)
+                    num_faces = len(encodings)
+                    image_id = get_or_create_image(hash_val, num_faces)
+                    logging.info(f"Image queued: {img} (encoded, new hash)")
+                except Exception as e:
+                    logging.warning(f"Error encoding image {img}: {e}")
+                    encodings = []
+                    num_faces = 0
+                    image_id = get_or_create_image(hash_val, num_faces)
+
+            map_file_to_image(file_path_id, image_id)
+
+            if encodings:
+                for encoding in encodings:
+                    insert_image_encoding(image_id, encoding)
+
+            if num_faces > 0:
+                return str(formatted_path)
+        except Exception as e:
+            logging.warning(f"Error processing image {img}: {e}")
+        return None
+
 
 # Example usage:
 # person_id = add_person("John Doe")
@@ -329,7 +390,8 @@ class FaceRecognitionApp(ctk.CTk):
 
     def update_random_face(self):
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH,timeout=10)
+
             c = conn.cursor()
             # Get a random known image and its person
             c.execute("""
@@ -376,10 +438,7 @@ class FaceRecognitionApp(ctk.CTk):
         if folder:
             self.root_folder = folder
             self.label_root_var.set(self.root_folder)
-            config.configfile.set("Settings", "root_folder", folder)
-            config.save_config()
-            self.matching_folders = []
-            for dirpath, dirnames, filenames in os.walk(folder):
+            for config.configfileames, filenames in os.walk(folder):
                 self.matching_folders.append(dirpath)
             self.label.configure(text=f"Matching Folders: {len(self.matching_folders)} found")
             logging.info(f"Matching Folders: {self.matching_folders}")
@@ -388,6 +447,11 @@ class FaceRecognitionApp(ctk.CTk):
     def select_output_folder(self):
         folder = filedialog.askdirectory()
         if folder:
+            config.set("Settings", "root_folder", folder)
+            config.save_config()
+            self.matching_folders = []
+            for dirpath, dirnames, filenames in os.walk(folder):
+                self.matching_folders.append(dirpath)
             self.output_folder = folder
             self.label_output_var.set(self.output_folder)
             config.configfile.set("Settings", "output_folder", folder)
@@ -414,56 +478,37 @@ class FaceRecognitionApp(ctk.CTk):
                 continue
         return total_images
 
+    
     def queue_images(self, folders=None):
-        logging.info("Building image list")
+        logging.info("Building image list with multiprocessing")
         queued_images = []
         total_images = 0
-        if folders is None:
-            folders = self.matching_folders
+        folders = folders or self.matching_folders
+
+        image_files = []
         for folder in folders:
             try:
-                image_files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('jpg', 'jpeg', 'png'))]
-                total_images += len(image_files)
-                for img in image_files:
-                    formatted_path = Path(img)
-                    hash_val = hash_image(img)
-                    file_path_id = get_or_create_file_path(str(formatted_path))
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        c = conn.cursor()
-                        c.execute("SELECT images.id, images.num_faces FROM images "
-                                  "JOIN file_image_map ON images.id = file_image_map.image_id "
-                                  "WHERE file_image_map.file_path_id=? AND images.hash=?", (file_path_id, hash_val))
-                        row = c.fetchone()
-                        if row:
-                            image_id = row[0]
-                            num_faces = row[1]
-                            encodings = []
-                            logging.info(f"Image queued: {img} (encoding already exists for this path, hash unchanged)")
-                        else:
-                            image = face_recognition.load_image_file(img)
-                            encodings = face_recognition.face_encodings(image)
-                            num_faces = len(encodings)
-                            image_id = get_or_create_image(hash_val, num_faces)
-                            logging.info(f"Image queued: {img} (encoding done, hash new or changed for this path)")
-                        conn.close()
-                    except Exception as e:
-                        logging.warning(f"Error loading image {img}: {e}")
-                        num_faces = 0
-                        encodings = []
-                        image_id = get_or_create_image(hash_val, num_faces)
-                    map_file_to_image(file_path_id, image_id)
-                    if encodings:
-                        for encoding in encodings:
-                            insert_image_encoding(image_id, encoding)
-                    # Only queue images with at least one face
-                    if num_faces and num_faces > 0:
-                        self.image_queue.put(formatted_path)
-                        queued_images.append(str(formatted_path))
+                files = [
+                    os.path.join(folder, f)
+                    for f in os.listdir(folder)
+                    if f.lower().endswith(('jpg', 'jpeg', 'png'))
+                ]
+                total_images += len(files)
+                image_files.extend(files)
             except Exception as e:
                 logging.warning(f"Error accessing folder '{folder}': {e}")
-                continue
-        logging.info(f"Queued {len(queued_images)} images for processing (out of {total_images} total images found in folders).")
+
+        with Pool(processes=cpu_count()) as pool:
+            results = pool.map(process_image_for_queue, image_files)
+            for result in results:
+                if result:
+                    self.image_queue.put(Path(result))
+                    queued_images.append(result)
+
+        logging.info(
+            f"Queued {len(queued_images)} images for processing (out of {total_images} total found)."
+        )
+
 
     def start_comparison(self):
         thread = threading.Thread(target=self.compare_faces)
@@ -567,7 +612,8 @@ class FaceRecognitionApp(ctk.CTk):
 
     def refresh_persons_optionmenu(self):
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH,timeout=10)
+
             c = conn.cursor()
             c.execute("SELECT name FROM persons")
             persons = [row[0] for row in c.fetchall()]
@@ -585,7 +631,8 @@ class FaceRecognitionApp(ctk.CTk):
         if not person_name:
             messagebox.showerror("Error", "Please select a person.")
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM persons WHERE name=?", (person_name,))
         row = c.fetchone()
@@ -615,7 +662,8 @@ def load_known_encodings_from_db():
     known_encodings = []
     known_person_ids = []
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         # Get all persons and their known images
         c.execute("""
@@ -643,13 +691,17 @@ def process_image(file_path, output_folder, known_encodings_list, known_person_i
         output_file_path = build_matches_file(file_path, output_folder)
         if os.path.exists(output_file_path):
             return file_path
+        # Load the image and get encodings
+        # todo: load encodings from database if it exists
+        
         unknown_image = face_recognition.load_image_file(file_path)
         unknown_encodings = face_recognition.face_encodings(unknown_image)
         known_encodings = [np.array(enc) for enc in known_encodings_list]
 
         # Get image_id for this file
         hash_val = hash_image(file_path)
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH,timeout=10)
+
         c = conn.cursor()
         c.execute("SELECT id FROM images WHERE hash=?", (hash_val,))
         row = c.fetchone()
@@ -659,7 +711,8 @@ def process_image(file_path, output_folder, known_encodings_list, known_person_i
         # Get already identified person_ids for this image
         already_identified = set()
         if image_id:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH,timeout=10)
+
             c = conn.cursor()
             c.execute("SELECT person_id FROM matches WHERE image_id=?", (image_id,))
             already_identified = set(pid[0] for pid in c.fetchall())
