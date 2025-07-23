@@ -229,6 +229,7 @@ def process_image_for_queue(img):
             hash_val = hash_image(img)
             file_path_id = get_or_create_file_path(str(formatted_path))
             try:
+                #TODO: implement connection pooling
                 conn = sqlite3.connect(DB_PATH,timeout=10)
 
                 c = conn.cursor()
@@ -692,7 +693,7 @@ def process_image(file_path, output_folder, known_encodings_list, known_person_i
         if os.path.exists(output_file_path):
             return file_path
         # Load the image and get encodings
-        # todo: load encodings from database if it exists
+        # TODO: load encodings from database if it exists
         
         unknown_image = face_recognition.load_image_file(file_path)
         unknown_encodings = face_recognition.face_encodings(unknown_image)
