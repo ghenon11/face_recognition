@@ -1,0 +1,6 @@
+customtkinter
+pillow
+numpy
+face_recognition
+face_recognition_models
+setproctitle
