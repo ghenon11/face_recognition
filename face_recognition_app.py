@@ -1,11 +1,12 @@
 import os,time
-import shutil
+import shutil,sys
 import logging, traceback
 import threading, multiprocessing, setproctitle
 from multiprocessing import Pool, cpu_count
 import random
 import concurrent.futures
 import face_recognition
+from datetime import datetime
 import utils, config
 import numpy as np
 from queue import Queue
@@ -13,6 +14,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import customtkinter as ctk
 from PIL import Image
+from PIL.ExifTags import TAGS
+import mimetypes
 import sqlite3
 import hashlib
 
@@ -299,6 +302,7 @@ class FaceRecognitionApp(ctk.CTk):
         self.main_frame = ctk.CTkFrame(self)
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=1)
+        self.main_frame.grid_columnconfigure(2, weight=1)
         for i in range(9):
             self.main_frame.grid_rowconfigure(i, weight=1)
         
@@ -312,6 +316,8 @@ class FaceRecognitionApp(ctk.CTk):
         self.label_root.grid(row=2, column=1, padx=10, pady=5)
         self.label_root_var = ctk.StringVar(value="Select Root Folder")
         self.label_root.configure(textvariable=self.label_root_var)
+        self.organize_button = ctk.CTkButton(self.main_frame, text="Organize Media", command=self.select_organize_media)
+        self.organize_button.grid(row=2, column=2, padx=10, pady=5)
        
         self.output_button = ctk.CTkButton(self.main_frame, text="Select Output Folder", command=self.select_output_folder)
         self.output_button.grid(row=3, column=0, padx=10, pady=5)
@@ -319,6 +325,7 @@ class FaceRecognitionApp(ctk.CTk):
         self.label_output.grid(row=3, column=1, padx=10, pady=5)
         self.label_output_var = ctk.StringVar(value="Set output path")
         self.label_output.configure(textvariable=self.label_output_var)
+        
         
         self.compare_button = ctk.CTkButton(self.main_frame, text="Compare Faces", command=self.start_comparison, state="disabled")
         self.compare_button.grid(row=4, column=0, padx=10, pady=5,columnspan=2)
@@ -439,11 +446,13 @@ class FaceRecognitionApp(ctk.CTk):
         if folder:
             self.root_folder = folder
             self.label_root_var.set(self.root_folder)
-            for config.configfileames, filenames in os.walk(folder):
+            for dirpath, dirnames, filenames in os.walk(folder):
                 self.matching_folders.append(dirpath)
             self.label.configure(text=f"Matching Folders: {len(self.matching_folders)} found")
             logging.info(f"Matching Folders: {self.matching_folders}")
             self.compare_button.configure(state="normal") 
+
+    
     
     def select_output_folder(self):
         folder = filedialog.askdirectory()
@@ -467,6 +476,49 @@ class FaceRecognitionApp(ctk.CTk):
         config.stop_flag=True
         time.sleep(10)
         self.quit()
+
+    def get_date_taken(self,path):
+        """Try to get date taken from EXIF, fallback to file modified time."""
+        try:
+            image = Image.open(path)
+            exif_data = image._getexif()
+            if exif_data:
+                for tag_id, value in exif_data.items():
+                    tag = TAGS.get(tag_id, tag_id)
+                    if tag == 'DateTimeOriginal':
+                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+        except Exception:
+            pass
+        # fallback: file modified time
+        ts = os.path.getmtime(path)
+        return datetime.fromtimestamp(ts)
+    
+    def select_organize_media(self):
+        root_folder=Path(self.root_folder)
+        if self.root_folder and root_folder and root_folder.is_dir():
+            logging.info(f"Organizing media in foler {root_folder}")
+            self.organize_media(root_folder, root_folder)
+        else:
+            logging.error(f"Folder {root_folder} is not valid")
+
+    def organize_media(self,src_folder, dest_folder):
+        src_folder = Path(src_folder)
+        dest_folder = Path(dest_folder)
+
+        for file_path in src_folder.iterdir():
+            try:
+                if file_path.is_file():
+                    mime_type, _ = mimetypes.guess_type(file_path)
+                    if mime_type and (mime_type.startswith('image') or mime_type.startswith('video')):
+                        date_taken = self.get_date_taken(file_path)
+                        folder_name = date_taken.strftime("%Y_%m")
+                        target_dir = dest_folder / folder_name
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(file_path), str(target_dir / file_path.name))
+                        logging.info(f"Moved: {file_path.name} -> {target_dir}")
+            except Exception as e:
+                logging.error(f"Error processing '{file_path}': {e}")
+                logging.debug(traceback.format_exc())
 
     def count_images_in_folders(self):
         total_images = 0
