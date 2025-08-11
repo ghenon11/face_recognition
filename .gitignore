@@ -162,3 +162,14 @@ cython_debug/
 # Working file
 /logs/*.log.*
 *.old.py
+logs/FaceRecognition.log.1
+logs/FaceRecognition.log.10
+logs/FaceRecognition.log.2
+logs/FaceRecognition.log.3
+logs/FaceRecognition.log.4
+logs/FaceRecognition.log.5
+logs/FaceRecognition.log.6
+logs/FaceRecognition.log.7
+logs/FaceRecognition.log.8
+logs/FaceRecognition.log.9
+/logs
