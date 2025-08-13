@@ -2,7 +2,9 @@ import sys,os,shutil,logging
 from logging.handlers import RotatingFileHandler
 import threading
 from threading import Timer
+import datetime
 from contextlib import contextmanager
+import re
 
 import config
 
@@ -40,10 +42,31 @@ def init_logging():
             RotatingFileHandler(config.LOG_FILE, maxBytes=50 * 1024 * 1024, backupCount=config.LOG_BACKUP_COUNT)
         ]
     )
+
+def add_timestamp_suffix(file_name):
+    # Get the current timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Split the file name and extension
+    name, ext = file_name.rsplit('.', 1)
+    # Create the new file name with the timestamp suffix
+    new_file_name = f"{name}_{timestamp}.{ext}"
+    return new_file_name
+
+def add_suffix(file_name, suffix):
+    # Split the file name and extension
+    name, ext = file_name.rsplit('.', 1)
+    # Create the new file name with the timestamp suffix
+    new_file_name = f"{name}_{suffix}.{ext}"
+    return new_file_name
     
 def path_exists(a_path):
     return os.path.exists(a_path)
  
+def clean_string(input_string):
+    # Use regex to keep only alphabetic characters, underscores, or points
+    # Replace non-alphanumeric characters with underscores
+    return re.sub(r'\W+', '_', input_string)
+
 def get_main_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)

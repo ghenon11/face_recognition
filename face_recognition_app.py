@@ -1,14 +1,21 @@
 import os,time
+import os.path as osp
 import shutil,sys
 import logging, traceback
-import threading, multiprocessing, setproctitle
+import threading, multiprocessing
 from multiprocessing import Pool, cpu_count
 import random
+import hashlib
+import json
 import concurrent.futures
-import face_recognition
+from deepface import DeepFace
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.image as mpimg
 from datetime import datetime
 import utils, config
 import numpy as np
+from tabulate import tabulate
 from queue import Queue
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
@@ -16,8 +23,9 @@ import customtkinter as ctk
 from PIL import Image
 from PIL.ExifTags import TAGS
 import mimetypes
+import pickle
+import pandas as pd
 import sqlite3
-import hashlib
 
 lock = threading.Lock()
 DB_PATH = "face_recognition.db"
@@ -379,6 +387,7 @@ class FaceRecognitionApp(ctk.CTk):
         
         self.root_folder = config.configfile.get("Settings", "root_folder", fallback="")
         self.output_folder = config.configfile.get("Settings", "output_folder", fallback="")
+        self.selected_image_path = config.configfile.get("Settings", "selected_image_path", fallback="")
 
         if self.root_folder:
             self.label_root_var.set(self.root_folder)
@@ -416,6 +425,10 @@ class FaceRecognitionApp(ctk.CTk):
             if not row:
                 logging.warning("No known images found in database!")
                 self.image_label.configure(text="No known image")
+                # temp load one face
+                image_files = [f for f in os.listdir(self.selected_image_path) if f.lower().endswith(('jpg', 'jpeg', 'png'))]
+                one_image=os.path.join(self.selected_image_path,image_files[0])
+                self.display_image(one_image, self.image_label)
                 return
             img_path = row[2]
             person_name = row[3]
@@ -567,51 +580,62 @@ class FaceRecognitionApp(ctk.CTk):
         thread = threading.Thread(target=self.compare_faces)
         thread.start()
               
-    def compare_faces(self):
-        if not self.root_folder:
-            messagebox.showerror("Error", "Please select a root folder with matching subfolders!")
+    def compare_faces_old(self):
+        """Compare faces using multiprocessing with detailed logging for each processed file."""
+        if not self.selected_image_path:
+            messagebox.showerror("Error", "Please select an image and a root folder with matching subfolders!")
             return
         if not self.output_folder or not os.path.exists(self.output_folder):
             messagebox.showerror("Error", "Please select a folder to hold images that matches !")
             return
+
         output_folder = self.output_folder
         os.makedirs(output_folder, exist_ok=True)
         self.label.configure(text=f"Starting image comparison")
+        
         logging.info("Building list of files")
-        self.queue_images()
+        self.queue_images()  # Populate the queue
         config.total_images = self.image_queue.qsize()
+
         logging.info(f"{config.total_images} images to process")
         config.processed_count = 0
-        logging.info(f"Loading known encodings from database")
-        known_encodings, known_person_ids = load_known_encodings_from_db()
+        logging.info(f"Encoding known faces")
+        known_encodings = load_known_encodings(self.selected_image_path)
         if not known_encodings:
-            raise ValueError("No known faces found in the database!")
+            raise ValueError("No face found in the selected image!")
+
         known_encodings_list = [enc.tolist() for enc in known_encodings]
         logging.info(f"Start processing with {config.WORKERS} workers")
+        
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=config.WORKERS, initializer=worker_init, initargs=(os.getpid(),)
         ) as executor:
             futures = {}
             while not self.image_queue.empty():
                 file_path = self.image_queue.get()
-                future = executor.submit(process_image, file_path, output_folder, known_encodings_list, known_person_ids)
+                future = executor.submit(process_image, file_path, output_folder,known_encodings_list)
                 futures[future] = file_path
+
             for future in concurrent.futures.as_completed(futures):
                 file_path = futures[future]
                 process_name = f"FaceRecWorker"
                 try:
                     result = future.result()
+                    
+                    # **LOG EVERY FILE PROCESSED**
                     logging.info(f"Processed: {file_path}")
+                    
                     if result:
                         logging.info(f"Image {file_path} matches with known face")
-                        output_file_path = build_matches_file(file_path, output_folder)
+                        # Copy file with new name
+                        output_file_path=build_matches_file(file_path,output_folder)
                         if not os.path.exists(output_file_path):
-                            shutil.copy(file_path, output_file_path)
+                            shutil.copy(file_path,output_file_path)
                         else:
                             logging.info(f"File {file_path} already exists")
                         with lock:
                             config.matches_found.append(file_path)
-                    if config.stop_flag:
+                    if config.stop_flag==True:
                         logging.warning("Stop flag detected. Cancelling remaining processing.")
                         for future in futures:
                             future.cancel()
@@ -625,7 +649,178 @@ class FaceRecognitionApp(ctk.CTk):
                 except Exception as e:
                     logging.error(f"{process_name}: Error processing {file_path}: {e}")
                     logging.error(traceback.format_exc())
+
         logging.info("All images processed")
+        os.remove(config.QUEUE_FILE)
+        # Show results
+        if config.matches_found:
+            messagebox.showinfo("Matches Found", f"{len(config.matches_found)} Matching Images copied to 'matched_faces' folder.")
+        else:
+            messagebox.showinfo("No Match", "No matching images found!")
+        return None
+    
+    def make_json_safe(self,obj, ignore_keys=None):
+        """
+        Recursively convert any Python object into a JSON-serializable,
+        order-stable form so hashing is deterministic.
+        Keys listed in ignore_keys are removed from dicts.
+        """
+        if ignore_keys is None:
+            ignore_keys = set()
+
+        if isinstance(obj, dict):
+            return {
+                k: self.make_json_safe(v, ignore_keys)
+                for k, v in sorted(obj.items())
+                if k not in ignore_keys
+            }
+        elif isinstance(obj, (list, tuple)):
+            return [self.make_json_safe(v, ignore_keys) for v in obj]
+        elif isinstance(obj, set):
+            return sorted(self.make_json_safe(v, ignore_keys) for v in obj)
+        else:
+            return obj
+
+    def stable_hash(self,obj, ignore_keys=None):
+        """
+        Create a stable SHA256 hash for any nested Python structure.
+        ignore_keys: set of dict keys to skip when hashing.
+        """
+        safe_obj = self.make_json_safe(obj, ignore_keys)
+        canonical_str = json.dumps(safe_obj, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(canonical_str.encode()).hexdigest()
+
+    def has_duplicates(data_list, ignore_keys=None):
+        seen = set()
+        for item in data_list:
+            h = self.stable_hash(item, ignore_keys)
+            if h in seen:
+                return True
+            seen.add(h)
+        return False
+
+    def unique_records(self,data_list, ignore_keys=None):
+        seen = set()
+        result = []
+        for item in data_list:
+            h = self.stable_hash(item, ignore_keys)
+            if h not in seen:
+                seen.add(h)
+                result.append(item)
+        return result
+
+    def combine_pickle_files(self,directory_path, output_file):
+        #   combined_df = pd.DataFrame()  # Initialize an empty DataFrame to store the merged data
+        combined_rep=[]
+        try:
+            for file_name in os.listdir(directory_path):
+                if file_name.endswith('.pkl'):
+                    file_path = osp.join(directory_path, file_name)
+                    with open(file_path, 'rb') as f:
+                        content = pickle.load(f)
+                        if isinstance(content, list):  # Ensure the data is a list
+                            combined_rep.extend(content)
+                        else:
+                            logging.warning(f"Warning: {file_path} does not contain a list!")
+            
+            for item in combined_rep:
+                file_id=item['identity']
+                #path_file_id=Path(item['identity'])
+                #if file_id != path_file_id:
+                #    logging.debug(f"Diff: {file_id} / {path_file_id}")
+                #    item['identity']=path_file_id
+                for r, _, f in os.walk(file_id):
+                    for file in f:
+                        exact_path = os.path.join(r, file)
+                        item['identity']=exact_path
+            combined_rep_nodup=self.unique_records(combined_rep)
+
+            with open(output_file, 'wb') as out:
+                pickle.dump(combined_rep_nodup, out, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+                logging.error(f"Error combining pickle files : {e}")
+                logging.debug(traceback.format_exc())
+    
+    def find_files_with_name(self,root_dir, target_name):
+        matching_files = []
+        for dirpath, _, filenames in os.walk(root_dir):
+            if target_name in filenames:
+                matching_files.append(os.path.join(dirpath, target_name))
+        return matching_files
+
+    def compare_faces(self):
+        """Compare faces using multiprocessing with detailed logging for each processed file."""
+        if not self.selected_image_path:
+            messagebox.showerror("Error", "Please select an image and a root folder with matching subfolders!")
+            return
+        if not self.output_folder or not os.path.exists(self.output_folder):
+            messagebox.showerror("Error", "Please select a folder to hold images that matches !")
+            return
+
+        output_folder = self.output_folder
+        os.makedirs(output_folder, exist_ok=True)
+        self.label.configure(text=f"Starting image comparison")
+
+        image_files = [f for f in os.listdir(self.selected_image_path) if f.lower().endswith(('jpg', 'jpeg', 'png'))]
+        one_image=os.path.join(self.selected_image_path,image_files[0])
+
+        logging.info("Merge all pickle files found in subdir")
+        try:
+            pkl_file_name="ds_model_vggface_detector_opencv_aligned_normalization_base_expand_0.pkl"
+            file_path = osp.join(self.root_folder, pkl_file_name)
+            if os.path.exists(file_path) and os.path.exists(os.path.join(self.root_folder,"merged",pkl_file_name)):
+                shutil.copyfile(file_path, utils.add_timestamp_suffix(file_path))
+                #with open(file_path, 'rb') as f:
+                    #content = pickle.load(f)os.path.join(self.root_folder,"merged",pkl_file_name)
+                    #logging.debug(json.dumps(content, indent=4))
+
+                shutil.copyfile(file_path, os.path.join(self.root_folder,"merged",pkl_file_name))
+
+            # if other plk file found with same name in subdir, merge them
+            matching_pkl_files=[]
+            matching_pkl_files=self.find_files_with_name(self.root_folder, pkl_file_name)
+            logging.debug(f"matching pkl files {matching_pkl_files}")
+            i=0
+            for matching_pkl in matching_pkl_files:
+                i+=1
+                matching_pkl_file_name = os.path.basename(matching_pkl)
+                matching_pkl_file_name = utils.add_suffix(matching_pkl_file_name,str(i)) 
+                new_file_path=os.path.join(self.root_folder,"merged",matching_pkl_file_name) 
+                if os.path.exists(os.path.join(self.root_folder,"merged")):
+                    logging.info(f"copy {matching_pkl} to {new_file_path}")
+                    shutil.copyfile(matching_pkl, new_file_path)
+            #if os.path.exists(os.path.join(self.root_folder,"merged")):
+            #    self.combine_pickle_files(os.path.join(self.root_folder,"merged"),file_path)
+
+        except Exception as e:
+                logging.error(f"Error Merging pickle files : {e}")
+                logging.debug(traceback.format_exc())
+
+        time.sleep(5)
+        logging.debug(f"DeepFace find with {one_image}")
+        results=[]
+        results = DeepFace.find(img_path = one_image, db_path = self.root_folder,enforce_detection=False)
+
+        try:
+            pd_results=results[0] #corresponds to the identity information for one individual detected in the source image.
+            logging.debug(tabulate(pd_results, headers='keys', tablefmt='psql'))
+            named_one_image=utils.clean_string(image_files[0])
+            pd_results.to_csv(f"data_{named_one_image}.csv", index=False)
+
+            config.matches_found=[]
+            #  Iterating through matches to store in folder 
+            for index, row in pd_results.iterrows():
+                file_path = row["identity"]
+                file_name = os.path.basename(file_path)
+                logging.info(f"match found at: filename: {file_path}")
+                new_file_path = os.path.join(self.output_folder, file_name)
+                config.matches_found.append(file_path)
+                # using shutil to copy image from path to new path
+                shutil.copyfile(file_path, new_file_path)
+        except Exception as e:
+                logging.error(f"Error processing deepface find results : {e}")
+                logging.debug(traceback.format_exc())
+        # Show results
         if config.matches_found:
             messagebox.showinfo("Matches Found", f"{len(config.matches_found)} Matching Images copied to 'matched_faces' folder.")
         else:
@@ -633,15 +828,9 @@ class FaceRecognitionApp(ctk.CTk):
         return None
     
     def update_ui(self):
-        matches_count=len(config.matches_found)
         if config.matches_found:
-            if not self.current_image == config.matches_found[matches_count-1]:
-                self.current_image = config.matches_found[matches_count-1]
-                self.display_image(self.current_image, self.match_image_label)
-        if config.processed_count > 0:
-            progress_ratio=config.processed_count / (config.total_images or 1)
-            self.progress_bar.set(progress_ratio)
-            self.label.configure(text=f"{matches_count} images matches, {config.processed_count} / {config.total_images} processed ")
+            self.current_image = random.choice(config.matches_found)
+            self.display_image(self.current_image, self.match_image_label)
         self.after(2000, self.update_ui)
 
     def queue_only_root_folder(self):
